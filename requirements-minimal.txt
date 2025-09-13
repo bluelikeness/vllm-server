@@ -1,0 +1,18 @@
+# vLLM Server Minimal Requirements
+# 버전 충돌 최소화를 위한 최소 의존성
+
+# 핵심 라이브러리 (버전 제약 없음)
+torch
+torchvision
+transformers
+vllm
+ray
+
+# 웹 프레임워크
+fastapi
+uvicorn
+
+# 기본 유틸리티
+Pillow
+python-dotenv
+requests
