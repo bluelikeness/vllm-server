@@ -446,7 +446,8 @@ async def list_models():
 
 if __name__ == "__main__":
     host = os.getenv("LLM_HOST", "0.0.0.0")
-    port = int(os.getenv("LLM_PORT", "8001"))
+    #port = int(os.getenv("LLM_PORT", "8001"))
+    port = int(os.getenv("LLM_PORT", "80"))
     workers = int(os.getenv("LLM_SERVER_WORKERS", "1"))
     
     uvicorn.run(
@@ -461,5 +462,6 @@ if __name__ == "__main__":
 
 def run():
     host = os.getenv("LLM_HOST", "0.0.0.0")
-    port = int(os.getenv("LLM_PORT", "8001"))
+    #port = int(os.getenv("LLM_PORT", "8001"))
+    port = int(os.getenv("LLM_PORT", "80"))
     uvicorn.run(app, host=host, port=port, log_level=os.getenv("LOG_LEVEL", "info").lower(), access_log=True)

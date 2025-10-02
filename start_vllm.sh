@@ -195,13 +195,13 @@ if command -v nvidia-smi >/dev/null 2>&1; then
         util=$(echo $util | xargs)
         mem_percent=$((mem_used * 100 / mem_total))
         echo "    GPU$idx ($name): ${mem_used}MB/${mem_total}MB (${mem_percent}%) - 사용률: ${util}%"
-        
+
         # 메모리 부족 경고
         if [ $mem_percent -gt 90 ]; then
             echo "    ⚠️ GPU$idx 메모리 사용률이 높습니다!"
         fi
     done
-    
+
     # GPU 프로세스 확인
     echo "  🔄 실행 중인 GPU 프로세스:"
     nvidia-smi --query-compute-apps=pid,name,used_memory --format=csv,noheader,nounits 2>/dev/null | \
@@ -219,7 +219,7 @@ fi
 echo "📚 vLLM 설치 확인..."
 
 # 필수 패키지 설치 확인 및 설치
-echo "  🔍 설치된 패키지 확인 중..."
+echo "  �� 설치된 패키지 확인 중..."
 NEED_INSTALL=false
 
 # 기본 패키지들 확인
@@ -250,27 +250,27 @@ fi
 
 if [ "$NEED_INSTALL" = true ]; then
     echo "  📥 누락된 패키지 설치 중..."
-    
+
     # 단계별 설치로 의존성 충돌 방지
     echo "    1️⃣ PyTorch 설치..."
     python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-    
+
     echo "    2️⃣ Transformers 및 기본 라이브러리 설치..."
     python -m pip install transformers accelerate
-    
+
     echo "    3️⃣ 웹 프레임워크 설치..."
     python -m pip install fastapi uvicorn[standard] python-multipart aiofiles
-    
+
     echo "    4️⃣ 유틸리티 라이브러리 설치..."
     python -m pip install Pillow opencv-python numpy scipy
     python -m pip install python-dotenv PyPDF2 python-docx openpyxl requests
-    
+
     echo "    5️⃣ Ray 설치..."
     python -m pip install ray[default]
-    
+
     echo "    6️⃣ vLLM 설치... (시간이 걸릴 수 있습니다)"
     python -m pip install vllm
-    
+
     echo "  ✅ 패키지 설치 완료"
 else
     echo "  ✅ 모든 필수 패키지가 이미 설치되어 있습니다"
@@ -337,7 +337,7 @@ if [ -d "$MODEL_PATH" ]; then
     echo "  ✅ 모델이 존재합니다: $MODEL_PATH"
     MODEL_SIZE=$(du -sh "$MODEL_PATH" 2>/dev/null | cut -f1 || echo "N/A")
     echo "  📊 모델 크기: $MODEL_SIZE"
-    
+
     # 모델 파일들 확인
     echo "  📂 모델 파일 목록:"
     ls -la "$MODEL_PATH/snapshots" 2>/dev/null | head -5 || \
@@ -347,14 +347,14 @@ else
     echo "  📥 예상 다운로드 크기: ~64GB (Qwen2.5-VL-32B)"
     echo "  ⏱️ 예상 다운로드 시간: 10-30분 (네트워크 속도에 따라)"
     echo "  📍 다운로드 위치: $MODEL_PATH"
-    
+
     # /data 디스크 공간 충분한지 확인
     AVAILABLE_GB=$(df /data 2>/dev/null | tail -1 | awk '{print int($4/1024/1024)}' || echo "0")
     if [ "$AVAILABLE_GB" -lt 70 ]; then
         echo "  ❌ /data 디스크 공간이 부족합니다 (필요: 70GB, 사용가능: ${AVAILABLE_GB}GB)"
         exit 1
     fi
-    
+
     # 사용자 확인
     echo -n "  ❓ 계속 진행하시겠습니까? (y/N): "
     read -r confirm

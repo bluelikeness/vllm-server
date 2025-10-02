@@ -42,9 +42,9 @@ engine_config: Dict[str, Any] = {}
 async def initialize_vllm_engine() -> bool:
     global vllm_engine, engine_config
     init_start = time.time()
-    
+
     logger.info("🚀 vLLM 엔진 초기화 시작")
-    
+
     try:
         # 안전 기본값: 텐서 병렬 미지정 시 1로 동작
         tensor_parallel_size = 1
@@ -106,8 +106,7 @@ async def initialize_vllm_engine() -> bool:
         if kv_cache_dtype and kv_cache_dtype.lower() in ("fp8", "int8"):
             kv_cache_dtype_setting = kv_cache_dtype.lower()
 
-    compute_dtype: Optional[str] = None
-    if load_mode in ("int4", "4bit"):
+        if load_mode in ("int4", "4bit"):
             # 4bit 양자화 설정
             if quant_method_env in ("awq", "gptq", "bitsandbytes", "bnb"):
                 quantization = "bitsandbytes" if quant_method_env in ("bitsandbytes", "bnb") else quant_method_env
@@ -116,7 +115,7 @@ async def initialize_vllm_engine() -> bool:
 
             logger.info(f"🔢 적용된 양자화: {quantization}")
             logger.info(f"🗄️ KV 캐시 최적화: {kv_cache_dtype_setting}")
-    elif load_mode in ("int8", "8bit"):
+        elif load_mode in ("int8", "8bit"):
             # 8bit 양자화 설정
             if quant_method_env in ("bitsandbytes", "bnb", "gptq", "awq"):
                 # INT8 기본은 bitsandbytes 권장
@@ -126,12 +125,6 @@ async def initialize_vllm_engine() -> bool:
 
             logger.info(f"🔢 적용된 양자화: {quantization}")
             logger.info(f"🗄️ KV 캐시 최적화: {kv_cache_dtype_setting}")
-
-        # dtype 호환성: awq는 bfloat16 미지원 → float16 강제
-        if quantization == "awq":
-            compute_dtype = "float16"
-            if load_mode in ("bf16", "bfloat16"):
-                logger.warning("⚠️ AWQ는 bfloat16을 지원하지 않습니다. dtype을 float16으로 강제합니다.")
 
         env_max_len = pick_env("MAX_MODEL_LEN")
         env_gpu_util = pick_env("GPU_MEMORY_UTILIZATION")
@@ -194,9 +187,6 @@ async def initialize_vllm_engine() -> bool:
             "enforce_eager": False,
             "limit_mm_per_prompt": {"image": 1} if MULTIMODAL_AVAILABLE else {"image": 0},
         }
-
-        if compute_dtype:
-            engine_args_dict["dtype"] = compute_dtype
 
         # LoRA 어댑터 설정 추가
         lora_paths_list: List[str] = []
@@ -279,14 +269,6 @@ async def initialize_vllm_engine() -> bool:
                 engine_args.gpu_memory_utilization = float(os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.85"))
                 vllm_engine = AsyncLLMEngine.from_engine_args(engine_args)
                 logger.info("✅ 양자화 없이 엔진 생성 성공")
-            elif "awq" in str(e).lower() and "bfloat16" in str(e).lower():
-                logger.info("🔄 AWQ + BF16 호환성 문제 감지 → dtype=float16으로 재시도...")
-                try:
-                    setattr(engine_args, "dtype", "float16")
-                    vllm_engine = AsyncLLMEngine.from_engine_args(engine_args)
-                    logger.info("✅ dtype=float16으로 재시도 성공")
-                except Exception:
-                    raise
             else:
                 raise
 
@@ -354,12 +336,12 @@ async def generate_with_vllm(
     start_time = time.time()
     timings: Dict[str, Any] = {}
     original_prompt = prompt
-    
+
     logger.info(f"🎯 [GPU-{request_id}] 텍스트 생성 시작")
     logger.info(f"📝 [GPU-{request_id}] 프롬프트 길이: {len(prompt)}자")
     logger.info(f"🖼️ [GPU-{request_id}] 이미지 포함: {'예' if images and len(images) > 0 else '아니오'}")
     logger.info(f"🎛️ [GPU-{request_id}] 최대 토큰: {max_tokens}, 온도: {temperature}")
-    
+
     # LoRA 어댑터 정보 로깅
     if lora_adapter:
         logger.info(f"🎯 [GPU-{request_id}] 요청된 LoRA 어댑터: {lora_adapter}")
@@ -374,7 +356,7 @@ async def generate_with_vllm(
     eff_tokens = max(1, int(min(max_tokens, int(os.getenv("MAX_TOKENS_CAP", "512")))))
     if eff_tokens != max_tokens:
         logger.info(f"⚙️ [GPU-{request_id}] 토큰 수 조정: {max_tokens} -> {eff_tokens}")
-        
+
     sampling_params = SamplingParams(
         max_tokens=eff_tokens,
         temperature=temperature,
@@ -382,7 +364,7 @@ async def generate_with_vllm(
         repetition_penalty=1.05,
         stop_token_ids=[],
     )
-    
+
     # 🆕 LoRA 어댑터가 지정된 경우 sampling_params에 추가
     if lora_adapter:
         try:
@@ -402,13 +384,13 @@ async def generate_with_vllm(
             if "<|image_pad|>" not in prompt and "<|vision_start|>" not in prompt:
                 prompt = f"<|vision_start|><|image_pad|><|vision_end|>\n{prompt}"
                 logger.info(f"📄 [GPU-{request_id}] 비전 태그 추가됨")
-            
+
             # 이미지 정보 로깅
             if images[0]:
                 img_size = images[0].size
                 img_mode = images[0].mode
                 logger.info(f"🖼️ [GPU-{request_id}] 이미지 정보: {img_size}, 모드: {img_mode}")
-            
+
             prompt = TextPrompt({"prompt": prompt, "multi_modal_data": {"image": images[0]} if images else {}})
             use_multimodal = True
             logger.info(f"✅ [GPU-{request_id}] 멀티모달 프롬프트 준비 완료")
@@ -423,7 +405,7 @@ async def generate_with_vllm(
 
     t_gen_start = time.time()
     logger.info(f"🚀 [GPU-{request_id}] vLLM 생성 시작...")
-    
+
     try:
         results_generator = vllm_engine.generate(prompt, sampling_params, request_id)
     except Exception as e:
@@ -453,21 +435,21 @@ async def generate_with_vllm(
             raise
 
     timings["generation_ms"] = round((time.time() - t_gen_start) * 1000, 1)
-    
+
     if final_output is None:
         logger.error(f"❌ [GPU-{request_id}] 생성 결과가 없습니다")
         raise RuntimeError("생성 결과가 없습니다")
-        
+
     response_text = "".join(o.text for o in final_output.outputs)
     timings["total_ms"] = round((time.time() - start_time) * 1000, 1)
     timings["tokens_generated"] = len(final_output.outputs[0].token_ids) if final_output.outputs else 0
-    
+
     # 타입 안전한 토큰/초 계산
     generation_time_seconds = float(timings["generation_ms"]) / 1000.0 if timings.get("generation_ms", 0) > 0 else 0
     timings["tokens_per_second"] = round(
         float(timings["tokens_generated"]) / generation_time_seconds, 1
     ) if generation_time_seconds > 0 else 0
-    
+
     # 생성 완료 로깅
     logger.info(f"🎯 [GPU-{request_id}] 텍스트 생성 완료")
     logger.info(f"⏱️ [GPU-{request_id}] 생성 시간: {timings['generation_ms']}ms")
@@ -475,9 +457,10 @@ async def generate_with_vllm(
     logger.info(f"🚀 [GPU-{request_id}] 속도: {timings['tokens_per_second']} tokens/sec")
     logger.info(f"📤 [GPU-{request_id}] 응답 길이: {len(response_text)}자")
     logger.info(f"💡 [GPU-{request_id}] 응답 미리보기: {response_text[:100]}...")
-    
+
     # 최종 GPU 상태 로깅
     final_gpu_status = get_gpu_status()
     logger.info(f"🖥️ [GPU-{request_id}] 생성 후 GPU 메모리: {final_gpu_status['memory_used']:.2f}GB / {final_gpu_status['memory_total']:.2f}GB")
-    
+
     return response_text.strip(), timings
+

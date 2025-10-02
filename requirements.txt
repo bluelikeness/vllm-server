@@ -37,3 +37,4 @@ requests>=2.31.0
 
 # GPU 가속 (선택적)
 # flash-attn>=2.3.0  # vLLM이 자동으로 처리
+

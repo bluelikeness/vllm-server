@@ -1,5 +1,7 @@
 #!/bin/bash
 
+#!/bin/bash
+
 # vLLM Server 시작 스크립트 - 모델/모드 선택 및 LoRA 어댑터 지원
 # 사용법: ./start_vllm_with_options.sh [start|start-bg|status] [FP16|INT4|INT8|BF16] [--with-lora]
 
@@ -116,8 +118,8 @@ case $ACTION in
         check_and_setup_lora
         show_current_config
         echo "🚀 vLLM 서버 시작 중..."
-        # 환경변수는 export로 이미 전달되므로 직접 실행
-        ./start_vllm.sh "$ACTION"
+        # 환경변수를 보존한 채로 자식 셸에서 실행
+        ACTION_INNER=$ACTION bash -c 'source ./start_vllm.sh "$ACTION_INNER"'
         ;;
     status)
         # .env만 읽을 경우 실효값이 보이지 않을 수 있으므로, 현재 셸의 override도 반영
@@ -142,3 +144,4 @@ case $ACTION in
         exit 1
         ;;
 esac
+
