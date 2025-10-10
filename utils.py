@@ -3,7 +3,7 @@ import io
 import time
 import json
 import base64
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 from PIL import Image
 
 MAX_IMAGE_SIDE = int(os.getenv("MAX_IMAGE_SIDE", "1280"))
@@ -119,3 +119,13 @@ def process_image_data(image_data: str) -> Image.Image:
         new_image.paste(image, offset)
         image = new_image
     return image
+
+
+def process_image_list(image_list: List[str]) -> List[Image.Image]:
+    processed_images: List[Image.Image] = []
+    for idx, image_data in enumerate(image_list):
+        try:
+            processed_images.append(process_image_data(image_data))
+        except Exception as exc:
+            raise ValueError(f"이미지 {idx} 처리 실패: {exc}") from exc
+    return processed_images

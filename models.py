@@ -23,12 +23,23 @@ class VisionRequest(BaseModel):
 class MultimodalRequest(BaseModel):
     message: str
     image_data: Optional[str] = None
+    image_list: Optional[List[str]] = None
     file_data: Optional[str] = None
     file_type: Optional[str] = None
     conversation_id: Optional[str] = None
     max_tokens: Optional[int] = 512
     json_only: Optional[bool] = False
     lora_adapter: Optional[str] = None  # 사용할 LoRA 어댑터 이름
+
+
+class MultiVisionRequest(BaseModel):
+    message: str
+    image_list: List[str]
+    conversation_id: Optional[str] = None
+    max_tokens: Optional[int] = 512
+    json_only: Optional[bool] = False
+    lora_adapter: Optional[str] = None
+    image_count: Optional[int] = None
 
 
 class GenerationResponse(BaseModel):
@@ -106,6 +117,32 @@ def format_vision_prompt(message: str, json_only: bool = False) -> str:
     parts = [
         f"<|im_start|>system\n{system_prompt}<|im_end|>",
         f"<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>\n{message}<|im_end|>",
+        "<|im_start|>assistant\n",
+    ]
+    return "\n".join(parts)
+
+
+def format_multi_vision_prompt(message: str, image_count: int, json_only: bool = False) -> str:
+    system_prompt = """여러 이미지를 순서대로 분석하고 사용자의 질문에 답해주세요.
+각 이미지에 대해 관찰한 내용을 명시하고, 필요한 경우 비교하거나 종합하세요.
+한국어로 답변해주세요."""
+    if json_only:
+        system_prompt += """
+
+응답은 반드시 다음 형식의 JSON으로만 제공해주세요:
+{
+    "analysis": [
+        {"image_index": 1, "details": ["항목1", "항목2"], "summary": "요약"},
+        ...
+    ],
+    "overall_summary": "전체 요약"
+}"""
+
+    user_parts = ["<|vision_start|><|image_pad|><|vision_end|>" for _ in range(max(1, image_count))]
+    user_payload = "\n".join(user_parts)
+    parts = [
+        f"<|im_start|>system\n{system_prompt}<|im_end|>",
+        f"<|im_start|>user\n{user_payload}\n{message}<|im_end|>",
         "<|im_start|>assistant\n",
     ]
     return "\n".join(parts)

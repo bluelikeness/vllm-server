@@ -1,6 +1,6 @@
 import os
+import io
 import time
-import logging
 from typing import Any, Dict, List, Optional, Tuple
 import re
 from PIL import Image
@@ -11,16 +11,8 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils import random_uuid
 from vllm.inputs import TextPrompt
 
-# 로깅 설정
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - [GPU] %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('/tmp/vllm_engine.log')
-    ]
-)
-logger = logging.getLogger(__name__)
+# 로깅 시스템 임포트
+from .logger_config import engine_logger as logger, RequestLogger
 
 
 MULTIMODAL_AVAILABLE = True
@@ -175,6 +167,13 @@ async def initialize_vllm_engine() -> bool:
         trust_remote_code = trc_val in ("1", "true", "yes", "y")
 
         # vLLM 엔진 인자 구성
+        max_images_per_prompt = 1
+        if MULTIMODAL_AVAILABLE:
+            try:
+                max_images_per_prompt = max(1, int(os.getenv("VLLM_MAX_IMAGES_PER_PROMPT", "4")))
+            except Exception:
+                max_images_per_prompt = 4
+
         engine_args_dict = {
             "model": model_name,
             "tensor_parallel_size": tensor_parallel_size,
@@ -185,8 +184,11 @@ async def initialize_vllm_engine() -> bool:
             "gpu_memory_utilization": chosen_gpu_util,
             "trust_remote_code": trust_remote_code,
             "enforce_eager": False,
-            "limit_mm_per_prompt": {"image": 1} if MULTIMODAL_AVAILABLE else {"image": 0},
+            "limit_mm_per_prompt": {"image": max_images_per_prompt} if MULTIMODAL_AVAILABLE else {"image": 0},
         }
+
+        if MULTIMODAL_AVAILABLE:
+            logger.info(f"🖼️ 요청당 허용 이미지 수: {max_images_per_prompt}")
 
         # LoRA 어댑터 설정 추가
         lora_paths_list: List[str] = []
@@ -326,36 +328,44 @@ async def generate_with_vllm(
     max_tokens: int = 512,
     temperature: float = 0.7,
     images: Optional[List[Image.Image]] = None,
-    lora_adapter: Optional[str] = None,  # 🆕 요청별 LoRA 어댑터 선택
+    lora_adapter: Optional[str] = None,
+    request_id: Optional[str] = None,  # 🆕 요청 ID 파라미터 추가
 ) -> Tuple[str, Dict[str, Any]]:
     global vllm_engine
     if vllm_engine is None:
         raise RuntimeError("vLLM 엔진이 초기화되지 않았습니다")
 
-    request_id = random_uuid()[:8]  # 짧은 요청 ID
+    # 요청 ID가 없으면 생성
+    if request_id is None:
+        request_id = random_uuid()[:8]
+    
+    # 요청 로거 초기화
+    req_logger = RequestLogger(logger, request_id)
+    
     start_time = time.time()
     timings: Dict[str, Any] = {}
     original_prompt = prompt
 
-    logger.info(f"🎯 [GPU-{request_id}] 텍스트 생성 시작")
-    logger.info(f"📝 [GPU-{request_id}] 프롬프트 길이: {len(prompt)}자")
-    logger.info(f"🖼️ [GPU-{request_id}] 이미지 포함: {'예' if images and len(images) > 0 else '아니오'}")
-    logger.info(f"🎛️ [GPU-{request_id}] 최대 토큰: {max_tokens}, 온도: {temperature}")
+    # 엔진 레벨 로깅
+    logger.info(f"🚀 [{request_id}] vLLM 엔진 생성 요청 시작")
+    logger.debug(f"📝 [{request_id}] 프롬프트 원본 길이: {len(prompt)}자")
+    logger.debug(f"🖼️ [{request_id}] 이미지 개수: {len(images) if images else 0}")
+    logger.debug(f"⚙️ [{request_id}] 최대 토큰: {max_tokens}, 온도: {temperature}")
 
-    # LoRA 어댑터 정보 로깅
+    # LoRA 어댑터 정보
     if lora_adapter:
-        logger.info(f"🎯 [GPU-{request_id}] 요청된 LoRA 어댑터: {lora_adapter}")
+        logger.info(f"🎯 [{request_id}] 요청된 LoRA 어댑터: {lora_adapter}")
     else:
         default_adapter = os.getenv("DEFAULT_LORA_ADAPTER", "")
         if default_adapter:
             lora_adapter = default_adapter
-            logger.info(f"🌟 [GPU-{request_id}] 기본 LoRA 어댑터 사용: {lora_adapter}")
+            logger.info(f"🌟 [{request_id}] 기본 LoRA 어댑터 사용: {lora_adapter}")
         else:
-            logger.info(f"🎯 [GPU-{request_id}] LoRA 어댑터: 사용 안함 (베이스 모델)")
+            logger.info(f"🎯 [{request_id}] LoRA 어댑터: 사용 안함 (베이스 모델)")
 
     eff_tokens = max(1, int(min(max_tokens, int(os.getenv("MAX_TOKENS_CAP", "512")))))
     if eff_tokens != max_tokens:
-        logger.info(f"⚙️ [GPU-{request_id}] 토큰 수 조정: {max_tokens} -> {eff_tokens}")
+        logger.info(f"⚙️ [{request_id}] 토큰 수 조정: {max_tokens} -> {eff_tokens}")
 
     sampling_params = SamplingParams(
         max_tokens=eff_tokens,
@@ -365,53 +375,68 @@ async def generate_with_vllm(
         stop_token_ids=[],
     )
 
-    # 🆕 LoRA 어댑터가 지정된 경우 sampling_params에 추가
+    # LoRA 어댑터가 지정된 경우 sampling_params에 추가
     if lora_adapter:
         try:
-            # vLLM 0.2.0+ 에서 지원하는 LoRA 요청별 지정
             sampling_params.lora_request = lora_adapter
-            logger.info(f"✅ [GPU-{request_id}] LoRA 어댑터 설정 완료: {lora_adapter}")
+            logger.info(f"✅ [{request_id}] LoRA 어댑터 설정 완료: {lora_adapter}")
         except AttributeError:
-            # 구버전 vLLM에서는 지원하지 않을 수 있음
-            logger.warning(f"⚠️ [GPU-{request_id}] 현재 vLLM 버전에서 요청별 LoRA 지정 미지원")
+            logger.warning(f"⚠️ [{request_id}] 현재 vLLM 버전에서 요청별 LoRA 지정 미지원")
         except Exception as e:
-            logger.warning(f"⚠️ [GPU-{request_id}] LoRA 어댑터 설정 실패: {e}")
+            logger.warning(f"⚠️ [{request_id}] LoRA 어댑터 설정 실패: {e}")
 
     use_multimodal = False
     if images and MULTIMODAL_AVAILABLE:
         try:
-            logger.info(f"🖼️ [GPU-{request_id}] 멀티모달 프롬프트 준비 중...")
+            logger.info(f"🖼️ [{request_id}] 멀티모달 프롬프트 준비 중...")
             if "<|image_pad|>" not in prompt and "<|vision_start|>" not in prompt:
                 prompt = f"<|vision_start|><|image_pad|><|vision_end|>\n{prompt}"
-                logger.info(f"📄 [GPU-{request_id}] 비전 태그 추가됨")
+                logger.debug(f"📄 [{request_id}] 비전 태그 추가됨")
 
-            # 이미지 정보 로깅
-            if images[0]:
-                img_size = images[0].size
-                img_mode = images[0].mode
-                logger.info(f"🖼️ [GPU-{request_id}] 이미지 정보: {img_size}, 모드: {img_mode}")
+            logger.info(f"🖼️ [{request_id}] 이미지 수: {len(images)}장")
 
-            prompt = TextPrompt({"prompt": prompt, "multi_modal_data": {"image": images[0]} if images else {}})
+            if logger.level <= 10:
+                for idx, img in enumerate(images):
+                    img_size = img.size
+                    img_mode = img.mode
+                    logger.debug(
+                        f"   └ 이미지 #{idx}: {img_size[0]}x{img_size[1]} ({img_mode})"
+                    )
+                    img_byte_arr = io.BytesIO()
+                    img.save(img_byte_arr, format=img.format or 'PNG')
+                    img_size_kb = len(img_byte_arr.getvalue()) / 1024
+                    logger.debug(f"      ↳ 예상 크기: {img_size_kb:.2f}KB")
+
+            multi_modal_payload = {"image": images[0] if len(images) == 1 else images}
+            prompt = TextPrompt({"prompt": prompt, "multi_modal_data": multi_modal_payload})
             use_multimodal = True
-            logger.info(f"✅ [GPU-{request_id}] 멀티모달 프롬프트 준비 완료")
+            logger.info(f"✅ [{request_id}] 멀티모달 프롬프트 준비 완료")
         except Exception as e:
-            logger.warning(f"⚠️ [GPU-{request_id}] 멀티모달 준비 실패, 텍스트 모드로 전환: {e}")
+            logger.warning(f"⚠️ [{request_id}] 멀티모달 준비 실패, 텍스트 모드로 전환: {e}")
             prompt = original_prompt
             use_multimodal = False
 
     # GPU 상태 로깅
     gpu_status = get_gpu_status()
-    logger.info(f"🖥️ [GPU-{request_id}] 생성 전 GPU 메모리: {gpu_status['memory_used']:.2f}GB / {gpu_status['memory_total']:.2f}GB")
+    logger.info(f"🖥️ [{request_id}] 생성 전 GPU 메모리: {gpu_status['memory_used']:.2f}GB / {gpu_status['memory_total']:.2f}GB ({gpu_status['memory_used']/gpu_status['memory_total']*100:.1f}%)")
+
+    # 프롬프트 상세 로깅 (DEBUG 모드)
+    if logger.level <= 10:  # DEBUG
+        if isinstance(prompt, str):
+            prompt_preview = prompt[:500] if len(prompt) > 500 else prompt
+            logger.debug(f"💬 [{request_id}] 프롬프트 미리보기:\n{'-'*80}\n{prompt_preview}\n{'-'*80}")
+        else:
+            logger.debug(f"💬 [{request_id}] 프롬프트 타입: {type(prompt).__name__}")
 
     t_gen_start = time.time()
-    logger.info(f"🚀 [GPU-{request_id}] vLLM 생성 시작...")
+    logger.info(f"🚀 [{request_id}] vLLM 생성 시작...")
 
     try:
         results_generator = vllm_engine.generate(prompt, sampling_params, request_id)
     except Exception as e:
-        logger.error(f"❌ [GPU-{request_id}] 생성 시작 실패: {e}")
+        logger.error(f"❌ [{request_id}] 생성 시작 실패: {e}")
         if use_multimodal:
-            logger.info(f"🔄 [GPU-{request_id}] 텍스트 모드로 재시도...")
+            logger.info(f"🔄 [{request_id}] 텍스트 모드로 재시도...")
             prompt = original_prompt
             results_generator = vllm_engine.generate(prompt, sampling_params, request_id)
         else:
@@ -419,14 +444,18 @@ async def generate_with_vllm(
 
     final_output = None
     try:
-        logger.info(f"⏳ [GPU-{request_id}] 응답 스트리밍 중...")
+        logger.info(f"⏳ [{request_id}] 응답 스트리밍 중...")
         async for request_output in results_generator:
             final_output = request_output
-        logger.info(f"✅ [GPU-{request_id}] 응답 스트리밍 완료")
+        logger.info(f"✅ [{request_id}] 응답 스트리밍 완료")
     except Exception as e:
-        logger.error(f"❌ [GPU-{request_id}] 스트리밍 실패: {e}")
+        logger.error(f"❌ [{request_id}] 스트리밍 실패: {e}")
+        if logger.level <= 10:  # DEBUG
+            import traceback
+            logger.debug(f"🔍 [{request_id}] 스택 트레이스:\n{traceback.format_exc()}")
+        
         if use_multimodal:
-            logger.info(f"🔄 [GPU-{request_id}] 텍스트 모드로 재시도...")
+            logger.info(f"🔄 [{request_id}] 텍스트 모드로 재시도...")
             prompt = original_prompt
             results_generator = vllm_engine.generate(prompt, sampling_params, request_id)
             async for request_output in results_generator:
@@ -437,7 +466,7 @@ async def generate_with_vllm(
     timings["generation_ms"] = round((time.time() - t_gen_start) * 1000, 1)
 
     if final_output is None:
-        logger.error(f"❌ [GPU-{request_id}] 생성 결과가 없습니다")
+        logger.error(f"❌ [{request_id}] 생성 결과가 없습니다")
         raise RuntimeError("생성 결과가 없습니다")
 
     response_text = "".join(o.text for o in final_output.outputs)
@@ -451,16 +480,26 @@ async def generate_with_vllm(
     ) if generation_time_seconds > 0 else 0
 
     # 생성 완료 로깅
-    logger.info(f"🎯 [GPU-{request_id}] 텍스트 생성 완료")
-    logger.info(f"⏱️ [GPU-{request_id}] 생성 시간: {timings['generation_ms']}ms")
-    logger.info(f"📊 [GPU-{request_id}] 생성 토큰: {timings['tokens_generated']}개")
-    logger.info(f"🚀 [GPU-{request_id}] 속도: {timings['tokens_per_second']} tokens/sec")
-    logger.info(f"📤 [GPU-{request_id}] 응답 길이: {len(response_text)}자")
-    logger.info(f"💡 [GPU-{request_id}] 응답 미리보기: {response_text[:100]}...")
+    logger.info(f"✅ [{request_id}] 텍스트 생성 완료")
+    logger.info(f"⏱️ [{request_id}] 생성 시간: {timings['generation_ms']}ms")
+    logger.info(f"📊 [{request_id}] 생성 토큰: {timings['tokens_generated']}개")
+    logger.info(f"🚀 [{request_id}] 속도: {timings['tokens_per_second']} tokens/sec")
+    logger.info(f"📤 [{request_id}] 응답 길이: {len(response_text)}자")
+    
+    # 응답 상세 로깅 (DEBUG 모드)
+    if logger.level <= 10:  # DEBUG
+        response_preview = response_text[:500] if len(response_text) > 500 else response_text
+        logger.debug(f"💡 [{request_id}] 응답 미리보기:\n{'-'*80}\n{response_preview}\n{'-'*80}")
+    else:
+        # INFO 모드에서는 짧은 미리보기
+        response_preview = response_text[:100] if len(response_text) > 100 else response_text
+        if len(response_text) > 100:
+            response_preview += "..."
+        logger.info(f"💡 [{request_id}] 응답 미리보기: {response_preview}")
 
     # 최종 GPU 상태 로깅
     final_gpu_status = get_gpu_status()
-    logger.info(f"🖥️ [GPU-{request_id}] 생성 후 GPU 메모리: {final_gpu_status['memory_used']:.2f}GB / {final_gpu_status['memory_total']:.2f}GB")
+    logger.info(f"🖥️ [{request_id}] 생성 후 GPU 메모리: {final_gpu_status['memory_used']:.2f}GB / {final_gpu_status['memory_total']:.2f}GB ({final_gpu_status['memory_used']/final_gpu_status['memory_total']*100:.1f}%)")
 
     return response_text.strip(), timings
 

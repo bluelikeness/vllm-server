@@ -9,6 +9,7 @@ import torch
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+from vllm.utils import random_uuid
 
 from . import engine
 from .models import (
@@ -22,14 +23,25 @@ from .models import (
     add_to_conversation,
     format_chat_prompt,
     format_vision_prompt,
+    format_multi_vision_prompt,
+    MultiVisionRequest,
 )
-from .utils import process_image_data, try_parse_json
+from .utils import process_image_data, process_image_list, try_parse_json
 from .file_io import process_uploaded_file
+from .logger_config import (
+    app_logger as logger,
+    RequestLogger,
+    log_multimodal_content,
+    log_conversation_context,
+)
 
 
 server_start_time = time.time()
 MAX_TOKENS_CAP = int(os.getenv("MAX_TOKENS_CAP", "512"))
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
+MAX_IMAGES_PER_REQUEST = int(
+    os.getenv("MAX_IMAGES_PER_REQUEST", os.getenv("VLLM_MAX_IMAGES_PER_PROMPT", "4"))
+)
 
 
 @asynccontextmanager
@@ -110,29 +122,87 @@ async def health_check():
 async def generate_text_endpoint(request: ChatRequest):
     if engine.vllm_engine is None:
         raise HTTPException(status_code=503, detail="vLLM 엔진이 초기화되지 않았습니다")
+    
+    # 요청 ID 생성 및 로거 초기화
+    request_id = random_uuid()[:8]
+    req_logger = RequestLogger(logger, request_id)
+    
+    # 요청 시작 로깅
+    req_logger.log_request_start(
+        endpoint="/generate",
+        max_tokens=request.max_tokens,
+        temperature=request.temperature,
+        lora_adapter=request.lora_adapter,
+    )
+    
     start_time = time.time()
     conversation_id = get_or_create_conversation(request.conversation_id)
+    
+    # 대화 컨텍스트 로깅
     messages = get_conversation_messages(conversation_id)
+    log_conversation_context(logger, request_id, conversation_id, len(messages))
+    
     messages.append({"role": "user", "content": request.message})
+    
     try:
         prompt = format_chat_prompt(messages)
+        
+        # 프롬프트 로깅
+        req_logger.log_prompt(prompt)
+        
+        # 생성 파라미터 로깅
+        req_logger.log_generation_params(
+            max_tokens=request.max_tokens,
+            temperature=request.temperature,
+        )
+        
+        # LoRA 어댑터 로깅
+        req_logger.log_lora_adapter(request.lora_adapter)
+        
+        # GPU 상태 로깅 (생성 전)
+        gpu_status_before = engine.get_gpu_status()
+        req_logger.log_gpu_status(
+            gpu_status_before['memory_used'],
+            gpu_status_before['memory_total'],
+            stage="생성 전"
+        )
+        
         response_text, gen_timings = await engine.generate_with_vllm(
             prompt=prompt, 
             max_tokens=request.max_tokens, 
             temperature=request.temperature,
-            lora_adapter=request.lora_adapter  # 🆕 LoRA 어댑터 전달
+            lora_adapter=request.lora_adapter,
+            request_id=request_id,  # 요청 ID 전달
         )
+        
+        # GPU 상태 로깅 (생성 후)
+        gpu_status_after = engine.get_gpu_status()
+        req_logger.log_gpu_status(
+            gpu_status_after['memory_used'],
+            gpu_status_after['memory_total'],
+            stage="생성 후"
+        )
+        
         add_to_conversation(conversation_id, "user", request.message)
         add_to_conversation(conversation_id, "assistant", response_text)
+        
         generation_time = time.time() - start_time
         t_json0 = time.time()
         parsed = try_parse_json(response_text)
         json_parse_ms = round((time.time() - t_json0) * 1000, 1)
+        
         timings_api = {
             "endpoint_total_ms": round(generation_time * 1000, 1),
             "json_parse_ms": json_parse_ms,
             **gen_timings,
         }
+        
+        # 응답 로깅
+        req_logger.log_response(response_text)
+        req_logger.log_json_response(parsed)
+        req_logger.log_timings(timings_api)
+        req_logger.log_request_end(success=True)
+        
         return GenerationResponse(
             response=response_text,
             conversation_id=conversation_id,
@@ -142,13 +212,15 @@ async def generate_text_endpoint(request: ChatRequest):
                 "engine": "vLLM",
                 "max_tokens": min(request.max_tokens or 512, MAX_TOKENS_CAP),
                 "temperature": request.temperature,
-                "lora_adapter": request.lora_adapter or os.getenv("DEFAULT_LORA_ADAPTER", "base"),  # 🆕 사용된 어댑터 정보
+                "lora_adapter": request.lora_adapter or os.getenv("DEFAULT_LORA_ADAPTER", "base"),
                 "timings": timings_api,
             },
             response_json=parsed,
             response_is_json=parsed is not None,
         )
     except Exception as e:
+        req_logger.log_error(e, context="텍스트 생성")
+        req_logger.log_request_end(success=False)
         raise HTTPException(status_code=500, detail=f"생성 오류: {str(e)}")
 
 
@@ -158,29 +230,91 @@ async def analyze_vision(request: VisionRequest):
         raise HTTPException(status_code=503, detail="vLLM 엔진이 초기화되지 않았습니다")
     if not engine.MULTIMODAL_AVAILABLE:
         raise HTTPException(status_code=503, detail="멀티모달 기능이 사용할 수 없습니다")
+    
+    # 요청 ID 생성 및 로거 초기화
+    request_id = random_uuid()[:8]
+    req_logger = RequestLogger(logger, request_id)
+    
+    # 요청 시작 로깅
+    req_logger.log_request_start(
+        endpoint="/vision",
+        max_tokens=request.max_tokens,
+        json_only=request.json_only,
+        lora_adapter=request.lora_adapter,
+    )
+    
     start_time = time.time()
     conversation_id = get_or_create_conversation(request.conversation_id)
+    
+    # 대화 컨텍스트 로깅
+    log_conversation_context(logger, request_id, conversation_id, len(active_conversations.get(conversation_id, [])))
+    
     try:
         image = process_image_data(request.image_data)
+        
+        # 이미지 로깅
+        req_logger.log_image(image, request.image_data)
+        
         prompt = format_vision_prompt(request.message, request.json_only)
+        
+        # 프롬프트 로깅
+        req_logger.log_prompt(prompt)
+        
+        # 생성 파라미터 로깅
+        req_logger.log_generation_params(
+            max_tokens=request.max_tokens,
+            temperature=0.7,
+            json_only=request.json_only,
+        )
+        
+        # LoRA 어댑터 로깅
+        req_logger.log_lora_adapter(request.lora_adapter)
+        
+        # GPU 상태 로깅 (생성 전)
+        gpu_status_before = engine.get_gpu_status()
+        req_logger.log_gpu_status(
+            gpu_status_before['memory_used'],
+            gpu_status_before['memory_total'],
+            stage="생성 전"
+        )
+        
         response_text, gen_timings = await engine.generate_with_vllm(
             prompt=prompt, 
             max_tokens=request.max_tokens, 
             temperature=0.7, 
             images=[image],
-            lora_adapter=request.lora_adapter  # 🆕 LoRA 어댑터 전달
+            lora_adapter=request.lora_adapter,
+            request_id=request_id,  # 요청 ID 전달
         )
+        
+        # GPU 상태 로깅 (생성 후)
+        gpu_status_after = engine.get_gpu_status()
+        req_logger.log_gpu_status(
+            gpu_status_after['memory_used'],
+            gpu_status_after['memory_total'],
+            stage="생성 후"
+        )
+        
         add_to_conversation(conversation_id, "user", request.message, "이미지 포함")
         add_to_conversation(conversation_id, "assistant", response_text)
+        
         generation_time = time.time() - start_time
         t_json0 = time.time()
         parsed = try_parse_json(response_text) if request.json_only else None
         json_parse_ms = round((time.time() - t_json0) * 1000, 1)
+        
         timings_api = {
             "endpoint_total_ms": round(generation_time * 1000, 1),
             "json_parse_ms": json_parse_ms,
             **gen_timings,
         }
+        
+        # 응답 로깅
+        req_logger.log_response(response_text)
+        req_logger.log_json_response(parsed)
+        req_logger.log_timings(timings_api)
+        req_logger.log_request_end(success=True)
+        
         return GenerationResponse(
             response=response_text,
             conversation_id=conversation_id,
@@ -190,7 +324,7 @@ async def analyze_vision(request: VisionRequest):
                 "engine": "vLLM+Vision",
                 "max_tokens": min(request.max_tokens or 512, MAX_TOKENS_CAP),
                 "temperature": 0.7,
-                "lora_adapter": request.lora_adapter or os.getenv("DEFAULT_LORA_ADAPTER", "base"),  # 🆕 사용된 어댑터 정보
+                "lora_adapter": request.lora_adapter or os.getenv("DEFAULT_LORA_ADAPTER", "base"),
                 "multimodal": True,
                 "timings": timings_api,
             },
@@ -198,6 +332,8 @@ async def analyze_vision(request: VisionRequest):
             response_is_json=parsed is not None,
         )
     except Exception as e:
+        req_logger.log_error(e, context="이미지 분석")
+        req_logger.log_request_end(success=False)
         raise HTTPException(status_code=500, detail=f"이미지 분석 오류: {str(e)}")
 
 
@@ -277,6 +413,129 @@ async def multimodal_analysis(request: MultimodalRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"멀티모달 분석 오류: {str(e)}")
 
+
+@app.post("/vision/multi", response_model=GenerationResponse)
+async def analyze_multi_vision(request: MultiVisionRequest):
+    if engine.vllm_engine is None:
+        raise HTTPException(status_code=503, detail="vLLM 엔진이 초기화되지 않았습니다")
+    if not engine.MULTIMODAL_AVAILABLE:
+        raise HTTPException(status_code=503, detail="멀티모달 기능이 사용할 수 없습니다")
+
+    if not request.image_list:
+        raise HTTPException(status_code=400, detail="image_list가 비어 있습니다")
+    if len(request.image_list) > MAX_IMAGES_PER_REQUEST:
+        raise HTTPException(
+            status_code=400,
+            detail=f"이미지 개수가 제한({MAX_IMAGES_PER_REQUEST}장)를 초과했습니다",
+        )
+
+    request_id = random_uuid()[:8]
+    req_logger = RequestLogger(logger, request_id)
+
+    req_logger.log_request_start(
+        endpoint="/vision/multi",
+        max_tokens=request.max_tokens,
+        json_only=request.json_only,
+        image_count=len(request.image_list),
+        lora_adapter=request.lora_adapter,
+    )
+
+    start_time = time.time()
+    conversation_id = get_or_create_conversation(request.conversation_id)
+    log_conversation_context(
+        logger, request_id, conversation_id, len(active_conversations.get(conversation_id, []))
+    )
+
+    try:
+        images = process_image_list(request.image_list)
+    except ValueError as exc:
+        req_logger.log_error(exc, context="이미지 전처리")
+        req_logger.log_request_end(success=False)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if not images:
+        req_logger.log_request_end(success=False)
+        raise HTTPException(status_code=400, detail="처리할 이미지가 없습니다")
+
+    # 첫 번째 이미지는 상세 로깅, 추가 이미지는 개수만 기록
+    req_logger.log_image(images[0], request.image_list[0])
+    if len(images) > 1:
+        logger.info(f"🖼️ [{request_id}] 추가 이미지: {len(images) - 1}장")
+
+    prompt = format_multi_vision_prompt(request.message, len(images), request.json_only)
+    req_logger.log_prompt(prompt)
+    req_logger.log_generation_params(
+        max_tokens=request.max_tokens,
+        temperature=0.7,
+        json_only=request.json_only,
+        image_count=len(images),
+    )
+    req_logger.log_lora_adapter(request.lora_adapter)
+
+    gpu_status_before = engine.get_gpu_status()
+    req_logger.log_gpu_status(
+        gpu_status_before["memory_used"],
+        gpu_status_before["memory_total"],
+        stage="생성 전",
+    )
+
+    try:
+        response_text, gen_timings = await engine.generate_with_vllm(
+            prompt=prompt,
+            max_tokens=request.max_tokens,
+            temperature=0.7,
+            images=images,
+            lora_adapter=request.lora_adapter,
+            request_id=request_id,
+        )
+    except Exception as e:
+        req_logger.log_error(e, context="멀티 이미지 분석")
+        req_logger.log_request_end(success=False)
+        raise HTTPException(status_code=500, detail=f"멀티 이미지 분석 오류: {str(e)}")
+
+    gpu_status_after = engine.get_gpu_status()
+    req_logger.log_gpu_status(
+        gpu_status_after["memory_used"],
+        gpu_status_after["memory_total"],
+        stage="생성 후",
+    )
+
+    add_to_conversation(conversation_id, "user", request.message, f"이미지 {len(images)}장")
+    add_to_conversation(conversation_id, "assistant", response_text)
+
+    generation_time = time.time() - start_time
+    t_json0 = time.time()
+    parsed = try_parse_json(response_text) if request.json_only else None
+    json_parse_ms = round((time.time() - t_json0) * 1000, 1)
+
+    timings_api = {
+        "endpoint_total_ms": round(generation_time * 1000, 1),
+        "json_parse_ms": json_parse_ms,
+        **gen_timings,
+    }
+
+    req_logger.log_response(response_text)
+    req_logger.log_json_response(parsed)
+    req_logger.log_timings(timings_api)
+    req_logger.log_request_end(success=True)
+
+    return GenerationResponse(
+        response=response_text,
+        conversation_id=conversation_id,
+        generation_time=round(generation_time, 2),
+        model_info={
+            "model_name": os.getenv("MODEL_NAME", "unknown"),
+            "engine": "vLLM+Vision",
+            "max_tokens": min(request.max_tokens or 512, MAX_TOKENS_CAP),
+            "temperature": 0.7,
+            "lora_adapter": request.lora_adapter or os.getenv("DEFAULT_LORA_ADAPTER", "base"),
+            "multimodal": True,
+            "image_count": len(images),
+            "timings": timings_api,
+        },
+        response_json=parsed,
+        response_is_json=parsed is not None,
+    )
 
 @app.post("/upload", response_model=GenerationResponse)
 async def upload_and_analyze(

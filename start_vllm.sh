@@ -11,6 +11,9 @@ PID_FILE="$BASE_DIR/vllm_server.pid"
 TS="$(date +%Y%m%d-%H%M%S)"
 TS_LOG="$LOG_DIR/server-$TS.log"
 CUR_LOG="$LOG_DIR/server.log"
+CUDA_HOME=/usr/local/cuda
+LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+PATH=/usr/local/cuda/bin:$PATH
 
 echo "🚀 CloudLLM vLLM 서버 관리: $ACTION"
 
